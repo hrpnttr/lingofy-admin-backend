@@ -3,9 +3,13 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Quiz\QuizQuestionNormalizer;
+use App\Quiz\QuizResultGrader;
+use App\Quiz\ResponseTypeCatalog;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 
@@ -41,6 +45,153 @@ class AdminDataController extends Controller
         $total = (clone $query)->count();
 
         return response()->json(['data' => $query->orderByDesc('createdAt')->limit(200)->get(), 'total' => $total]);
+    }
+
+    public function progressReviews(Request $request): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        $students = DB::table('students')->where('tenant_id', $tenantId)
+            ->select(['id', 'full_name', 'email', 'createdAt'])->orderBy('full_name')->get();
+        $courses = DB::table('courses')->where('tenant_id', $tenantId)->pluck('title', 'id');
+        $classes = DB::table('classes')->whereIn('course_id', $courses->keys())
+            ->select(['id', 'course_id', 'class_name'])->get();
+        $quizzes = DB::table('quizzes')->where('tenant_id', $tenantId)->where('type', 'quiz')
+            ->whereIn('class_id', $classes->pluck('id'))
+            ->select(['id', 'class_id', 'title'])->get();
+        $enrollments = DB::table('scourses')->whereIn('studentId', $students->pluck('id'))
+            ->select(['studentId', 'contents'])->get()->keyBy('studentId');
+        $quizIds = $quizzes->pluck('id');
+        $attempts = DB::table('quizz_results')
+            ->join('students', 'quizz_results.studentId', '=', 'students.id')
+            ->join('quizzes', 'quizz_results.quiz_id', '=', 'quizzes.id')
+            ->where('students.tenant_id', $tenantId)->where('quizzes.tenant_id', $tenantId)
+            ->whereIn('quizz_results.quiz_id', $quizIds)
+            ->select([
+                'quizz_results.id', 'quizz_results.studentId', 'quizz_results.quiz_id',
+                'quizz_results.answers', 'quizz_results.score', 'quizz_results.createdAt',
+                'students.full_name', 'students.email', 'quizzes.title as quiz_title',
+                'quizzes.class_id', 'quizzes.contens as quiz_questions',
+            ])->orderByDesc('quizz_results.createdAt')->get();
+
+        $classesById = $classes->keyBy('id');
+        $attemptsByStudent = $attempts->groupBy('studentId');
+        $studentRows = $students->map(function ($student) use ($enrollments, $courses, $classes, $quizzes, $attemptsByStudent) {
+            $contents = json_decode($enrollments->get($student->id)->contents ?? '[]', true) ?: [];
+            $enrolledCourseIds = collect($contents)->pluck('courseId')->map(fn ($id) => (int) $id)->filter(fn ($id) => $courses->has($id));
+            $assignedClasses = $classes->whereIn('course_id', $enrolledCourseIds);
+            $assignedQuizzes = $quizzes->whereIn('class_id', $assignedClasses->pluck('id'));
+            $studentAttempts = $attemptsByStudent->get($student->id, collect());
+            $completedQuizIds = $studentAttempts->pluck('quiz_id')->unique();
+            $classNames = $assignedClasses->pluck('class_name')->unique()->values();
+            $lastActive = $studentAttempts->first()->createdAt ?? null;
+
+            return [
+                'id' => $student->id,
+                'full_name' => $student->full_name,
+                'email' => $student->email,
+                'class_name' => $classNames->join(', ') ?: 'No class enrolled',
+                'assigned_tasks' => $assignedQuizzes->count(),
+                'completed_tasks' => $completedQuizIds->intersect($assignedQuizzes->pluck('id'))->count(),
+                'submission_count' => $studentAttempts->count(),
+                'last_active' => $lastActive,
+            ];
+        });
+
+        $assignedTasks = $studentRows->sum('assigned_tasks');
+        $completedTasks = $studentRows->sum('completed_tasks');
+
+        $enrolledCourseIdsByStudent = $students->mapWithKeys(function ($student) use ($enrollments) {
+            $contents = json_decode($enrollments->get($student->id)->contents ?? '[]', true) ?: [];
+
+            return [$student->id => collect($contents)->pluck('courseId')->map(fn ($id) => (int) $id)->unique()->values()];
+        });
+        $studentProgress = function (Collection $quizIds, int $courseId) use ($students, $enrolledCourseIdsByStudent, $attemptsByStudent): array {
+            $members = $students->filter(fn ($student) => $enrolledCourseIdsByStudent->get($student->id)->contains($courseId))
+                ->map(function ($student) use ($attemptsByStudent, $quizIds) {
+                    $scopedAttempts = $attemptsByStudent->get($student->id, collect())->whereIn('quiz_id', $quizIds);
+
+                    return [
+                        'id' => $student->id,
+                        'full_name' => $student->full_name,
+                        'email' => $student->email,
+                        'assigned_tasks' => $quizIds->count(),
+                        'completed_tasks' => $scopedAttempts->pluck('quiz_id')->unique()->count(),
+                        'submission_count' => $scopedAttempts->count(),
+                        'last_active' => $scopedAttempts->first()->createdAt ?? null,
+                    ];
+                })->values();
+            $assigned = $members->sum('assigned_tasks');
+
+            return [
+                'quiz_count' => $quizIds->count(),
+                'student_count' => $members->count(),
+                'submission_count' => $members->sum('submission_count'),
+                'on_track' => $members->filter(fn ($student) => $student['assigned_tasks'] > 0 && $student['completed_tasks'] >= $student['assigned_tasks'] * 0.75)->count(),
+                'average_completion' => $assigned > 0 ? (int) round(($members->sum('completed_tasks') / $assigned) * 100) : 0,
+                'students' => $members,
+            ];
+        };
+
+        $quizzesByClass = $quizzes->groupBy('class_id');
+        $classGroups = $classes->sortBy('class_name', SORT_NATURAL | SORT_FLAG_CASE)->map(function ($class) use ($courses, $quizzesByClass, $studentProgress) {
+            $progress = $studentProgress($quizzesByClass->get($class->id, collect())->pluck('id'), (int) $class->course_id);
+
+            return [
+                'id' => $class->id,
+                'course_id' => $class->course_id,
+                'name' => $class->class_name,
+                'course_title' => $courses[$class->course_id] ?? '',
+                ...$progress,
+            ];
+        })->values();
+
+        $courseGroups = $courses->map(function ($title, $courseId) use ($classes, $quizzes, $studentProgress) {
+            $courseClassIds = $classes->where('course_id', $courseId)->pluck('id');
+            $progress = $studentProgress($quizzes->whereIn('class_id', $courseClassIds)->pluck('id'), (int) $courseId);
+            unset($progress['students']);
+
+            return [
+                'id' => $courseId,
+                'title' => $title,
+                'class_count' => $courseClassIds->count(),
+                ...$progress,
+            ];
+        })->sortBy('title', SORT_NATURAL | SORT_FLAG_CASE)->values();
+
+        return response()->json([
+            'summary' => [
+                'students' => $studentRows->count(),
+                'on_track' => $studentRows->filter(fn ($student) => $student['assigned_tasks'] > 0 && $student['completed_tasks'] >= $student['assigned_tasks'] * 0.75)->count(),
+                'submissions' => $attempts->count(),
+                'average_completion' => $assignedTasks > 0 ? (int) round(($completedTasks / $assignedTasks) * 100) : 0,
+            ],
+            'students' => $studentRows->values(),
+            'submissions' => $attempts->map(function ($attempt) use ($classesById, $courses) {
+                $class = $classesById->get($attempt->class_id);
+                $answers = json_decode($attempt->answers ?: '[]', true) ?: [];
+                $summary = QuizResultGrader::summarize($answers, (int) $attempt->score);
+
+                return [
+                    'id' => $attempt->id,
+                    'student_name' => $attempt->full_name,
+                    'student_email' => $attempt->email,
+                    'quiz_title' => $attempt->quiz_title,
+                    'class_id' => $attempt->class_id,
+                    'course_id' => $class->course_id ?? null,
+                    'class_name' => $class->class_name ?? '',
+                    'course_title' => $class ? ($courses[$class->course_id] ?? '') : '',
+                    'score' => $summary['score'],
+                    'points_earned' => $summary['points_earned'],
+                    'points_max' => $summary['points_max'],
+                    'pending_review' => $summary['pending_review'],
+                    'answers' => $answers,
+                    'questions' => json_decode($attempt->quiz_questions ?: '[]', true) ?: [],
+                    'submitted_at' => $attempt->createdAt,
+                ];
+            })->values(),
+            'courses' => $courseGroups,
+            'classes' => $classGroups,
+        ]);
     }
 
     public function createStudent(Request $request): JsonResponse
@@ -121,13 +272,29 @@ class AdminDataController extends Controller
             ->where('quizzes.type', 'quiz')
             ->select([
                 'quizzes.id', 'quizzes.class_id', 'quizzes.title', 'quizzes.description',
-                'quizzes.updatedAt', 'classes.class_name', 'courses.title as course_title',
+                'quizzes.is_active', 'quizzes.updatedAt', 'classes.class_name', 'courses.title as course_title',
             ])
             ->orderByDesc('quizzes.updatedAt')
             ->limit(200)
             ->get();
 
         return response()->json(['data' => $data]);
+    }
+
+    public function updateQuiz(Request $request, int $quizId): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        $data = $request->validate([
+            'is_active' => ['required', 'boolean'],
+        ]);
+        $quizQuery = DB::table('quizzes')->where('tenant_id', $tenantId)->where('type', 'quiz')->where('id', $quizId);
+        if (! $quizQuery->clone()->exists()) {
+            return response()->json(['message' => 'Quiz not found in this organization.'], 404);
+        }
+
+        $quizQuery->clone()->update(['is_active' => $data['is_active'], 'updatedAt' => now()]);
+
+        return response()->json($quizQuery->select(['id', 'class_id', 'title', 'is_active', 'updatedAt'])->first());
     }
 
     public function createClass(Request $request): JsonResponse
@@ -277,24 +444,23 @@ class AdminDataController extends Controller
             'title' => ['required', 'string', 'max:255'],
             'description' => ['nullable', 'string', 'max:10000'],
             'contens' => ['required', 'array', 'min:1', 'max:40'],
-            'contens.*.question' => ['required', 'string', 'max:2000'],
-            'contens.*.choices' => ['required', 'array', 'min:2', 'max:6'],
-            'contens.*.choices.*.text' => ['required', 'string', 'max:500'],
-            'contens.*.choices.*.is_correct' => ['required', 'boolean'],
+            'contens.*' => ['array'],
         ]);
 
-        foreach ($data['contens'] as $question) {
-            $correctAnswers = count(array_filter($question['choices'], fn (array $choice): bool => filter_var($choice['is_correct'], FILTER_VALIDATE_BOOLEAN)));
-            if ($correctAnswers !== 1) {
-                return response()->json(['message' => 'Each quiz question needs exactly one correct answer.'], 422);
-            }
+        $responseTypesById = $this->tenantResponseTypes($tenantId)->keyBy('id')->all();
+        $normalized = (new QuizQuestionNormalizer($responseTypesById))->normalize($data['contens']);
+        if ($normalized['errors'] !== []) {
+            return response()->json([
+                'message' => 'Some questions need attention before the quiz can be saved.',
+                'errors' => $normalized['errors'],
+            ], 422);
         }
 
         $quizValues = [
             'title' => $data['title'],
             'description' => $data['description'] ?? null,
             'type' => 'quiz',
-            'contens' => json_encode($data['contens']),
+            'contens' => json_encode($normalized['questions']),
             'updatedAt' => now(),
         ];
         $existingQuiz = DB::table('quizzes')
@@ -375,5 +541,150 @@ class AdminDataController extends Controller
         DB::table('courses')->where('tenant_id', $tenantId)->where('id', $courseId)->update($data);
 
         return response()->json(DB::table('courses')->where('tenant_id', $tenantId)->where('id', $courseId)->first());
+    }
+
+    public function responseTypes(Request $request): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        $usage = [];
+        DB::table('quizzes')->where('tenant_id', $tenantId)->pluck('contens')->each(function (?string $contents) use (&$usage): void {
+            foreach (json_decode($contents ?: '[]', true) ?: [] as $question) {
+                $typeId = (int) ($question['response_type_id'] ?? 0);
+                $usage[$typeId] = ($usage[$typeId] ?? 0) + 1;
+            }
+        });
+
+        return response()->json([
+            'data' => $this->tenantResponseTypes($tenantId)
+                ->map(fn (array $type): array => [...$type, 'question_count' => $usage[$type['id']] ?? 0])
+                ->values(),
+            'base_types' => collect(ResponseTypeCatalog::baseTypes())
+                ->map(fn (string $baseType): array => ['base_type' => $baseType, ...ResponseTypeCatalog::definition($baseType)])
+                ->values(),
+        ]);
+    }
+
+    public function createResponseType(Request $request): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        $this->tenantResponseTypes($tenantId);
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:80', Rule::unique('tenant_quiz_response_types', 'name')->where('tenant_id', $tenantId)],
+            'base_type' => ['required', Rule::in(ResponseTypeCatalog::baseTypes())],
+            'settings' => ['nullable', 'array'],
+            'is_active' => ['sometimes', 'boolean'],
+        ]);
+
+        if (DB::table('tenant_quiz_response_types')->where('tenant_id', $tenantId)->count() >= 40) {
+            return response()->json(['message' => 'An organization can have up to 40 response types.'], 422);
+        }
+
+        $id = DB::table('tenant_quiz_response_types')->insertGetId([
+            'tenant_id' => $tenantId,
+            'name' => trim($data['name']),
+            'base_type' => $data['base_type'],
+            'settings' => json_encode(ResponseTypeCatalog::normalizeSettings($data['base_type'], $data['settings'] ?? [])),
+            'is_active' => $data['is_active'] ?? true,
+            'sort_order' => (int) DB::table('tenant_quiz_response_types')->where('tenant_id', $tenantId)->max('sort_order') + 1,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        return response()->json(ResponseTypeCatalog::present(DB::table('tenant_quiz_response_types')->where('id', $id)->first()), 201);
+    }
+
+    /**
+     * Update a response type's name, validation settings or availability.
+     *
+     * The base type is fixed after creation so existing questions keep their meaning,
+     * and question content stored on quizzes is never rewritten here.
+     */
+    public function updateResponseType(Request $request, int $responseTypeId): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        $responseType = DB::table('tenant_quiz_response_types')->where('tenant_id', $tenantId)->where('id', $responseTypeId)->first();
+        if (! $responseType) {
+            return response()->json(['message' => 'Response type not found in this organization.'], 404);
+        }
+
+        $data = $request->validate([
+            'name' => ['sometimes', 'required', 'string', 'max:80', Rule::unique('tenant_quiz_response_types', 'name')->where('tenant_id', $tenantId)->ignore($responseTypeId)],
+            'settings' => ['sometimes', 'nullable', 'array'],
+            'is_active' => ['sometimes', 'boolean'],
+        ]);
+
+        $values = ['updated_at' => now()];
+        if (array_key_exists('name', $data)) {
+            $values['name'] = trim($data['name']);
+        }
+        if (array_key_exists('settings', $data)) {
+            $values['settings'] = json_encode(ResponseTypeCatalog::normalizeSettings($responseType->base_type, $data['settings'] ?? []));
+        }
+        if (array_key_exists('is_active', $data)) {
+            $values['is_active'] = $data['is_active'];
+        }
+        DB::table('tenant_quiz_response_types')->where('id', $responseTypeId)->update($values);
+
+        return response()->json(ResponseTypeCatalog::present(DB::table('tenant_quiz_response_types')->where('id', $responseTypeId)->first()));
+    }
+
+    public function gradeQuizResult(Request $request, int $resultId): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        $data = $request->validate([
+            'grades' => ['required', 'array', 'min:1', 'max:40'],
+            'grades.*.question_index' => ['required', 'integer', 'min:0'],
+            'grades.*.points' => ['required', 'integer', 'min:0'],
+        ]);
+
+        $result = DB::table('quizz_results')
+            ->join('students', 'quizz_results.studentId', '=', 'students.id')
+            ->where('students.tenant_id', $tenantId)
+            ->where('quizz_results.id', $resultId)
+            ->select(['quizz_results.id', 'quizz_results.answers', 'quizz_results.score'])
+            ->first();
+        if (! $result) {
+            return response()->json(['message' => 'Submission not found in this organization.'], 404);
+        }
+
+        $pointsByQuestionIndex = collect($data['grades'])->mapWithKeys(fn (array $grade): array => [(int) $grade['question_index'] => (int) $grade['points']])->all();
+        try {
+            $answers = QuizResultGrader::applyGrades(json_decode($result->answers ?: '[]', true) ?: [], $pointsByQuestionIndex);
+        } catch (\InvalidArgumentException $exception) {
+            return response()->json(['message' => $exception->getMessage()], 422);
+        }
+
+        $summary = QuizResultGrader::summarize($answers, (int) $result->score);
+        DB::table('quizz_results')->where('id', $resultId)->update([
+            'answers' => json_encode($answers),
+            'score' => $summary['score'],
+            'updatedAt' => now(),
+        ]);
+
+        return response()->json(['id' => $resultId, 'answers' => $answers, ...$summary]);
+    }
+
+    /**
+     * The tenant's Form Builder response types, giving a new tenant the seven standard types first.
+     *
+     * @return Collection<int, array{id: int, name: string, base_type: string, input_control: string, input_label: string, grading_mode: string, settings: array<string, mixed>, is_active: bool, sort_order: int}>
+     */
+    private function tenantResponseTypes(int $tenantId): Collection
+    {
+        $query = fn () => DB::table('tenant_quiz_response_types')->where('tenant_id', $tenantId)->orderBy('sort_order')->orderBy('id')->get();
+        $rows = $query();
+
+        if ($rows->isEmpty()) {
+            $now = now();
+            DB::table('tenant_quiz_response_types')->insertOrIgnore(array_map(
+                fn (array $row): array => [...$row, 'tenant_id' => $tenantId, 'created_at' => $now, 'updated_at' => $now],
+                ResponseTypeCatalog::defaultRows(),
+            ));
+            $rows = $query();
+        }
+
+        return $rows->filter(fn (object $row): bool => ResponseTypeCatalog::exists($row->base_type))
+            ->map(fn (object $row): array => ResponseTypeCatalog::present($row))
+            ->values();
     }
 }
