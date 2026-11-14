@@ -6,9 +6,12 @@ use App\Http\Controllers\Controller;
 use App\Quiz\QuizQuestionNormalizer;
 use App\Quiz\QuizResultGrader;
 use App\Quiz\ResponseTypeCatalog;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Database\QueryException;
+use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
@@ -30,8 +33,14 @@ class AdminDataController extends Controller
 
     public function students(Request $request): JsonResponse
     {
+        $validated = $request->validate([
+            'q' => ['nullable', 'string', 'max:255'],
+            'status' => ['nullable', 'in:active,inactive'],
+            'page' => ['nullable', 'integer', 'min:1'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+        ]);
         $tenantId = $request->attributes->get('tenant')->id;
-        $query = DB::table('students')->select(['id', 'full_name', 'email', 'phone', 'createdAt'])
+        $query = DB::table('students')->select(['id', 'full_name', 'email', 'phone', 'is_active', 'createdAt'])
             ->where('tenant_id', $tenantId);
 
         if ($request->filled('q')) {
@@ -42,9 +51,118 @@ class AdminDataController extends Controller
             });
         }
 
-        $total = (clone $query)->count();
+        if (isset($validated['status'])) {
+            $query->where('is_active', $validated['status'] === 'active');
+        }
 
-        return response()->json(['data' => $query->orderByDesc('createdAt')->limit(200)->get(), 'total' => $total]);
+        $students = $query->orderByDesc('createdAt')->orderByDesc('id')
+            ->paginate($validated['per_page'] ?? 20, ['*'], 'page', $validated['page'] ?? 1);
+
+        return response()->json([
+            'data' => $students->items(),
+            'total' => $students->total(),
+            'current_page' => $students->currentPage(),
+            'last_page' => $students->lastPage(),
+            'per_page' => $students->perPage(),
+        ]);
+    }
+
+    public function updateStudentStatus(Request $request, int $studentId): JsonResponse
+    {
+        $validated = $request->validate(['is_active' => ['required', 'boolean']]);
+        $tenantId = $request->attributes->get('tenant')->id;
+        $student = DB::table('students')->where('tenant_id', $tenantId)->where('id', $studentId)->first(['id']);
+
+        if ($student === null) {
+            return response()->json(['message' => 'Student not found.'], 404);
+        }
+
+        DB::table('students')->where('id', $studentId)->update(['is_active' => $validated['is_active']]);
+
+        return response()->json(DB::table('students')->where('id', $studentId)
+            ->first(['id', 'full_name', 'email', 'phone', 'is_active', 'createdAt']));
+    }
+
+    public function studentEnrollments(Request $request, int $studentId): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        if (! DB::table('students')->where('tenant_id', $tenantId)->where('id', $studentId)->exists()) {
+            return response()->json(['message' => 'Student not found.'], 404);
+        }
+
+        return response()->json(['data' => $this->enrollmentCourses($tenantId, $studentId)]);
+    }
+
+    public function enrollStudent(Request $request, int $studentId): JsonResponse
+    {
+        $validated = $request->validate([
+            'course_ids' => ['required', 'array', 'min:1', 'max:50'],
+            'course_ids.*' => ['integer', 'distinct'],
+        ]);
+        $tenantId = $request->attributes->get('tenant')->id;
+
+        $courses = DB::table('courses')->where('tenant_id', $tenantId)
+            ->whereIn('id', $validated['course_ids'])->get(['id', 'title']);
+        if ($courses->count() !== count($validated['course_ids'])) {
+            return response()->json(['message' => 'One or more courses are not available in this organization.'], 422);
+        }
+
+        $added = DB::transaction(function () use ($tenantId, $studentId, $courses) {
+            $student = DB::table('students')->where('tenant_id', $tenantId)->where('id', $studentId)->lockForUpdate()->first(['id']);
+            if ($student === null) {
+                return null;
+            }
+
+            $enrollment = DB::table('scourses')->where('studentId', $studentId)->first(['id', 'contents']);
+            $contents = json_decode($enrollment->contents ?? '[]', true) ?: [];
+            $existingIds = collect($contents)->pluck('courseId')->map(fn ($id) => (string) $id);
+            $newItems = $courses->reject(fn ($course) => $existingIds->contains((string) $course->id))
+                ->map(fn ($course) => ['courseId' => (string) $course->id, 'title' => $course->title])->values();
+
+            if ($newItems->isNotEmpty()) {
+                $payload = json_encode([...$contents, ...$newItems->all()]);
+                if ($enrollment === null) {
+                    DB::table('scourses')->insert(['studentId' => $studentId, 'contents' => $payload, 'createdAt' => now()]);
+                } else {
+                    DB::table('scourses')->where('id', $enrollment->id)->update(['contents' => $payload]);
+                }
+            }
+
+            return $newItems->count();
+        });
+
+        if ($added === null) {
+            return response()->json(['message' => 'Student not found.'], 404);
+        }
+
+        return response()->json([
+            'added' => $added,
+            'data' => $this->enrollmentCourses($tenantId, $studentId),
+        ]);
+    }
+
+    /**
+     * Every course in the tenant, flagged with whether the student is already enrolled.
+     *
+     * @return Collection<int, array<string, mixed>>
+     */
+    private function enrollmentCourses(int $tenantId, int $studentId): Collection
+    {
+        $contents = json_decode(DB::table('scourses')->where('studentId', $studentId)->value('contents') ?? '[]', true) ?: [];
+        $enrolledIds = collect($contents)->pluck('courseId')->map(fn ($id) => (string) $id);
+
+        return DB::table('courses')->where('tenant_id', $tenantId)
+            ->orderBy('title')
+            ->get(['id', 'title', 'level', 'language', 'price', 'published'])
+            ->map(fn ($course) => [
+                'id' => $course->id,
+                'title' => $course->title,
+                'level' => $course->level,
+                'language' => $course->language,
+                'price' => (float) $course->price,
+                'published' => (bool) $course->published,
+                'enrolled' => $enrolledIds->contains((string) $course->id),
+            ]);
     }
 
     public function progressReviews(Request $request): JsonResponse
@@ -68,7 +186,7 @@ class AdminDataController extends Controller
             ->whereIn('quizz_results.quiz_id', $quizIds)
             ->select([
                 'quizz_results.id', 'quizz_results.studentId', 'quizz_results.quiz_id',
-                'quizz_results.answers', 'quizz_results.score', 'quizz_results.createdAt',
+                'quizz_results.answers', 'quizz_results.score', 'quizz_results.reopened_at', 'quizz_results.createdAt',
                 'students.full_name', 'students.email', 'quizzes.title as quiz_title',
                 'quizzes.class_id', 'quizzes.contens as quiz_questions',
             ])->orderByDesc('quizz_results.createdAt')->get();
@@ -187,11 +305,41 @@ class AdminDataController extends Controller
                     'answers' => $answers,
                     'questions' => json_decode($attempt->quiz_questions ?: '[]', true) ?: [],
                     'submitted_at' => $attempt->createdAt,
+                    'reopened_at' => $attempt->reopened_at,
                 ];
             })->values(),
             'courses' => $courseGroups,
             'classes' => $classGroups,
         ]);
+    }
+
+    public function reopenQuizResult(Request $request, int $resultId): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        $result = DB::table('quizz_results')
+            ->join('students', 'quizz_results.studentId', '=', 'students.id')
+            ->join('quizzes', 'quizz_results.quiz_id', '=', 'quizzes.id')
+            ->where('quizz_results.id', $resultId)
+            ->where('students.tenant_id', $tenantId)
+            ->where('quizzes.tenant_id', $tenantId)
+            ->first(['quizz_results.id', 'quizz_results.studentId', 'quizz_results.quiz_id', 'quizz_results.reopened_at']);
+
+        if ($result === null) {
+            return response()->json(['message' => 'Submission not found.'], 404);
+        }
+
+        if ($result->reopened_at !== null) {
+            return response()->json(['message' => 'This quiz is already reopened for the student.'], 409);
+        }
+
+        $reopenedAt = now();
+        DB::table('quizz_results')
+            ->where('studentId', $result->studentId)
+            ->where('quiz_id', $result->quiz_id)
+            ->whereNull('reopened_at')
+            ->update(['reopened_at' => $reopenedAt]);
+
+        return response()->json(['id' => $result->id, 'reopened_at' => $reopenedAt->toDateTimeString()]);
     }
 
     public function createStudent(Request $request): JsonResponse
@@ -287,7 +435,7 @@ class AdminDataController extends Controller
         $data = $request->validate([
             'is_active' => ['required', 'boolean'],
         ]);
-        $quizQuery = DB::table('quizzes')->where('tenant_id', $tenantId)->where('type', 'quiz')->where('id', $quizId);
+        $quizQuery = DB::table('quizzes')->where('tenant_id', $tenantId)->whereIn('type', ['quiz', 'placement'])->where('id', $quizId);
         if (! $quizQuery->clone()->exists()) {
             return response()->json(['message' => 'Quiz not found in this organization.'], 404);
         }
@@ -440,29 +588,7 @@ class AdminDataController extends Controller
             return response()->json(['message' => 'Class not found in this organization.'], 404);
         }
 
-        $data = $request->validate([
-            'title' => ['required', 'string', 'max:255'],
-            'description' => ['nullable', 'string', 'max:10000'],
-            'contens' => ['required', 'array', 'min:1', 'max:40'],
-            'contens.*' => ['array'],
-        ]);
-
-        $responseTypesById = $this->tenantResponseTypes($tenantId)->keyBy('id')->all();
-        $normalized = (new QuizQuestionNormalizer($responseTypesById))->normalize($data['contens']);
-        if ($normalized['errors'] !== []) {
-            return response()->json([
-                'message' => 'Some questions need attention before the quiz can be saved.',
-                'errors' => $normalized['errors'],
-            ], 422);
-        }
-
-        $quizValues = [
-            'title' => $data['title'],
-            'description' => $data['description'] ?? null,
-            'type' => 'quiz',
-            'contens' => json_encode($normalized['questions']),
-            'updatedAt' => now(),
-        ];
+        $quizValues = [...$this->validatedQuizValues($request, $tenantId), 'type' => 'quiz'];
         $existingQuiz = DB::table('quizzes')
             ->where('class_id', $classId)
             ->where('tenant_id', $tenantId)
@@ -481,10 +607,78 @@ class AdminDataController extends Controller
 
         $materials = json_decode($class->materials ?: '[]', true) ?: [];
         $materials = array_values(array_filter($materials, fn ($material): bool => ! is_array($material) || ($material['type'] ?? null) !== 'quiz'));
-        $materials[] = ['title' => $data['title'], 'type' => 'quiz'];
+        $materials[] = ['title' => $quizValues['title'], 'type' => 'quiz'];
         DB::table('classes')->where('id', $classId)->update(['materials' => json_encode($materials), 'updated_at' => now()]);
 
-        return response()->json(['id' => $quizId, 'title' => $data['title'], 'class_id' => $classId]);
+        return response()->json(['id' => $quizId, 'title' => $quizValues['title'], 'class_id' => $classId]);
+    }
+
+    public function placementTests(Request $request): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        $attemptCounts = DB::table('quizz_results')
+            ->join('quizzes', 'quizz_results.quiz_id', '=', 'quizzes.id')
+            ->where('quizzes.tenant_id', $tenantId)
+            ->where('quizzes.type', 'placement')
+            ->groupBy('quizz_results.quiz_id')
+            ->pluck(DB::raw('count(*)'), 'quizz_results.quiz_id');
+        $tests = DB::table('quizzes')
+            ->where('tenant_id', $tenantId)
+            ->where('type', 'placement')
+            ->whereNull('class_id')
+            ->select(['id', 'title', 'description', 'contens', 'is_active', 'updatedAt'])
+            ->orderBy('title')
+            ->get()
+            ->map(fn ($test): array => [
+                'id' => $test->id,
+                'title' => $test->title,
+                'description' => $test->description,
+                'question_count' => count(json_decode($test->contens ?: '[]', true) ?: []),
+                'attempt_count' => (int) ($attemptCounts[$test->id] ?? 0),
+                'is_active' => $test->is_active,
+                'updatedAt' => $test->updatedAt,
+            ]);
+
+        return response()->json(['data' => $tests]);
+    }
+
+    public function placementTest(Request $request, int $placementTestId): JsonResponse
+    {
+        $test = $this->placementTestQuery($request, $placementTestId)->first();
+        if (! $test) {
+            return response()->json(['message' => 'Placement test not found in this organization.'], 404);
+        }
+        $test->contens = json_decode($test->contens ?: '[]', true) ?: [];
+
+        return response()->json(['data' => $test]);
+    }
+
+    public function createPlacementTest(Request $request): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        $values = $this->validatedQuizValues($request, $tenantId);
+        $id = DB::table('quizzes')->insertGetId([
+            ...$values,
+            'tenant_id' => $tenantId,
+            'class_id' => null,
+            'type' => 'placement',
+            'is_active' => true,
+            'createdAt' => now(),
+        ]);
+
+        return response()->json(['id' => $id, 'title' => $values['title']], 201);
+    }
+
+    public function updatePlacementTest(Request $request, int $placementTestId): JsonResponse
+    {
+        $tenantId = $request->attributes->get('tenant')->id;
+        if (! $this->placementTestQuery($request, $placementTestId)->exists()) {
+            return response()->json(['message' => 'Placement test not found in this organization.'], 404);
+        }
+        $values = $this->validatedQuizValues($request, $tenantId);
+        $this->placementTestQuery($request, $placementTestId)->update($values);
+
+        return response()->json(['id' => $placementTestId, 'title' => $values['title']]);
     }
 
     public function createCourse(Request $request): JsonResponse
@@ -669,6 +863,48 @@ class AdminDataController extends Controller
      *
      * @return Collection<int, array{id: int, name: string, base_type: string, input_control: string, input_label: string, grading_mode: string, settings: array<string, mixed>, is_active: bool, sort_order: int}>
      */
+    private function placementTestQuery(Request $request, int $placementTestId): Builder
+    {
+        return DB::table('quizzes')
+            ->where('tenant_id', $request->attributes->get('tenant')->id)
+            ->where('type', 'placement')
+            ->whereNull('class_id')
+            ->where('id', $placementTestId);
+    }
+
+    /**
+     * Validate a quiz or placement test body and normalize its questions.
+     *
+     * @return array{title: string, description: ?string, contens: string, updatedAt: Carbon}
+     *
+     * @throws HttpResponseException when a question is invalid
+     */
+    private function validatedQuizValues(Request $request, int $tenantId): array
+    {
+        $data = $request->validate([
+            'title' => ['required', 'string', 'max:255'],
+            'description' => ['nullable', 'string', 'max:10000'],
+            'contens' => ['required', 'array', 'min:1', 'max:40'],
+            'contens.*' => ['array'],
+        ]);
+
+        $responseTypesById = $this->tenantResponseTypes($tenantId)->keyBy('id')->all();
+        $normalized = (new QuizQuestionNormalizer($responseTypesById))->normalize($data['contens']);
+        if ($normalized['errors'] !== []) {
+            throw new HttpResponseException(response()->json([
+                'message' => 'Some questions need attention before the quiz can be saved.',
+                'errors' => $normalized['errors'],
+            ], 422));
+        }
+
+        return [
+            'title' => $data['title'],
+            'description' => $data['description'] ?? null,
+            'contens' => json_encode($normalized['questions']),
+            'updatedAt' => now(),
+        ];
+    }
+
     private function tenantResponseTypes(int $tenantId): Collection
     {
         $query = fn () => DB::table('tenant_quiz_response_types')->where('tenant_id', $tenantId)->orderBy('sort_order')->orderBy('id')->get();

@@ -13,12 +13,19 @@ Route::middleware('tenant.admin')->prefix('admin')->group(function () {
     Route::get('/students', [AdminDataController::class, 'students']);
     Route::get('/progress-reviews', [AdminDataController::class, 'progressReviews']);
     Route::post('/students', [AdminDataController::class, 'createStudent']);
+    Route::get('/students/{studentId}/enrollments', [AdminDataController::class, 'studentEnrollments'])->whereNumber('studentId');
+    Route::post('/students/{studentId}/enrollments', [AdminDataController::class, 'enrollStudent'])->whereNumber('studentId');
+    Route::patch('/students/{studentId}/status', [AdminDataController::class, 'updateStudentStatus'])->whereNumber('studentId');
     Route::get('/courses', [AdminDataController::class, 'courses']);
     Route::post('/courses', [AdminDataController::class, 'createCourse']);
     Route::patch('/courses/{courseId}', [AdminDataController::class, 'updateCourse']);
     Route::get('/classes', [AdminDataController::class, 'classes']);
     Route::get('/quizzes', [AdminDataController::class, 'quizzes']);
     Route::patch('/quizzes/{quizId}', [AdminDataController::class, 'updateQuiz']);
+    Route::get('/placement-tests', [AdminDataController::class, 'placementTests']);
+    Route::post('/placement-tests', [AdminDataController::class, 'createPlacementTest']);
+    Route::get('/placement-tests/{placementTestId}', [AdminDataController::class, 'placementTest'])->whereNumber('placementTestId');
+    Route::put('/placement-tests/{placementTestId}', [AdminDataController::class, 'updatePlacementTest'])->whereNumber('placementTestId');
     Route::post('/classes', [AdminDataController::class, 'createClass']);
     Route::get('/classes/{classId}/content', [AdminDataController::class, 'classContent']);
     Route::patch('/classes/{classId}', [AdminDataController::class, 'updateClass']);
@@ -27,4 +34,5 @@ Route::middleware('tenant.admin')->prefix('admin')->group(function () {
     Route::post('/response-types', [AdminDataController::class, 'createResponseType']);
     Route::patch('/response-types/{responseTypeId}', [AdminDataController::class, 'updateResponseType']);
     Route::patch('/quiz-results/{resultId}/grades', [AdminDataController::class, 'gradeQuizResult']);
+    Route::patch('/quiz-results/{resultId}/reopen', [AdminDataController::class, 'reopenQuizResult'])->whereNumber('resultId');
 });
